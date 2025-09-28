@@ -506,63 +506,205 @@ def precompute_freqs_cis(dim: int, end: int = int(32 * 1024), theta: float = 1e6
 
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     """
-    将旋转位置编码应用到查询（Q）和键（K）向量上
+    将旋转位置编码(RoPE)应用到查询（Q）和键（K）向量上
     
-    这是RoPE的核心实现函数，通过复数旋转的方式将位置信息融入注意力机制。
+    🎯 论文对照解析 - RoFormer: Enhanced Transformer with Rotary Position Embedding
+    ===========================================================================
+    
+    📚 理论背景：
+    -----------
+    RoPE是由苏剑林等人在2021年提出的位置编码方法，论文标题：
+    "RoFormer: Enhanced Transformer with Rotary Position Embedding"
+    
+    🔍 与传统位置编码的对比：
+    ----------------------
+    1. **绝对位置编码 (Attention is All You Need)**：
+       - 在输入词嵌入时加上sin/cos位置编码
+       - 问题：位置信息会随着层数增加而衰减
+    
+    2. **相对位置编码 (Self-Attention with Relative Position)**：
+       - 在注意力计算时加入相对位置偏置
+       - 问题：额外的参数开销和计算复杂度
+       
+    3. **旋转位置编码 (RoPE)**：⭐ 本函数实现
+       - 通过旋转变换将位置信息编码到Q和K中
+       - 优势：同时具备绝对和相对位置感知，且无额外参数
+    
+    🧮 数学原理详解：
+    ---------------
+    论文中的核心公式：
+    
+    对于位置m的query向量q和位置n的key向量k：
+    q_m' = R_Θ,m * q_m
+    k_n' = R_Θ,n * k_n
+    
+    其中R_Θ,m是旋转矩阵：
+    R_Θ,m = [cos(mθ)  -sin(mθ)]
+            [sin(mθ)   cos(mθ)]
+    
+    关键洞察：q_m' · k_n' = q_m · R_Θ,m-n · k_n
+    这意味着注意力分数只依赖于相对位置差 (m-n)！
+    
+    💡 复数域表示：
+    ------------
+    论文将向量对看作复数：q = [q₀, q₁] → q₀ + i*q₁
+    旋转操作：q' = q * e^(i*m*θ) = q * (cos(mθ) + i*sin(mθ))
+    
+    🔧 实数域实现：
+    ------------
+    本函数将复数旋转转换为实数计算：
+    对于向量 [x₀, x₁, x₂, x₃, ...]，每相邻两个元素组成一个复数
+    [x₀ + i*x₁, x₂ + i*x₃, ...] 进行旋转
     
     Args:
         q (torch.Tensor): 查询向量，形状为 (batch_size, seq_len, num_heads, head_dim)
         k (torch.Tensor): 键向量，形状为 (batch_size, seq_len, num_heads, head_dim)
-        cos (torch.Tensor): 预计算的余弦频率矩阵
-        sin (torch.Tensor): 预计算的正弦频率矩阵
-        position_ids (torch.Tensor, optional): 位置ID，暂未使用
-        unsqueeze_dim (int): 在哪个维度添加维度以进行广播，默认为1
+        cos (torch.Tensor): 预计算的余弦频率矩阵，形状为 (seq_len, head_dim//2)
+        sin (torch.Tensor): 预计算的正弦频率矩阵，形状为 (seq_len, head_dim//2)
+        position_ids (torch.Tensor, optional): 位置ID，保留参数但此实现中未使用
+        unsqueeze_dim (int): 在哪个维度添加维度以进行广播，默认为1(head维度)
         
     Returns:
-        tuple: (q_embed, k_embed) - 应用了位置编码的查询和键向量
+        tuple: (q_embed, k_embed) - 应用了RoPE位置编码的查询和键向量
+        
+    🎯 与论文公式的对应关系：
+    --------------------
+    论文公式: f_q(x_m, m) = R_Θ,m W_q x_m
+    代码实现: q_embed = (q * cos) + (rotate_half(q) * sin)
+    
+    其中：
+    - q = W_q x_m (线性投影后的查询向量)
+    - cos, sin = cos(mθ), sin(mθ) (位置m的旋转角度)
+    - rotate_half 实现复数旋转的虚部操作
     """
     def rotate_half(x):
         """
-        将向量的后半部分移到前面，前半部分移到后面并取负号
-        这是复数旋转在实数域的等价实现
+        实现复数旋转的关键函数 - 对应论文中的虚部处理
+        
+        🧮 数学原理：
+        -----------
+        对于复数 z = a + bi，旋转 e^(iθ) 后：
+        z' = z * e^(iθ) = (a + bi) * (cos(θ) + i*sin(θ))
+           = (a*cos(θ) - b*sin(θ)) + i*(a*sin(θ) + b*cos(θ))
+        
+        在实数域中，我们将 [a, b] 看作复数 a + bi：
+        - 实部：a*cos(θ) - b*sin(θ) = [a, b] * cos(θ) + [-b, a] * sin(θ)
+        - rotate_half([a, b]) = [-b, a] 对应复数乘法中的 i*z 操作
+        
+        📊 具体变换：
+        -----------
+        输入向量：[x₀, x₁, x₂, x₃, x₄, x₅] (head_dim=6)
+        分组复数：[(x₀, x₁), (x₂, x₃), (x₄, x₅)]
+        rotate_half：[x₁, x₀, x₃, x₂, x₅, x₄] → [-x₁, x₀, -x₃, x₂, -x₅, x₄]
+        等价于：[(-x₁, x₀), (-x₃, x₂), (-x₅, x₄)] = i * 原复数
         
         Args:
-            x (torch.Tensor): 输入向量
+            x (torch.Tensor): 输入向量，最后一维应为偶数
             
         Returns:
-            torch.Tensor: 旋转后的向量
+            torch.Tensor: 旋转后的向量，对应复数域中的 i*x 操作
         """
-        # 获取向量的中点位置
-        # 训练作用：实现复数旋转的实数等价，保持梯度的连续性
-        # 推理作用：高效计算旋转变换，不增加额外的计算复杂度
+        # 获取向量的中点位置 - 对应复数的实部和虚部分界点
+        # 论文中每两个相邻元素组成一个复数进行旋转
+        # 训练作用：实现可微的复数旋转操作，保持梯度流的连续性
+        # 推理作用：高效计算位置编码，无额外参数和内存开销
         mid = x.shape[-1] // 2
         
-        # 分割向量并重新组合：[x2, x1] -> [-x2, x1]
-        # 这等价于复数乘法 (a + bi) * (cos + sin*i) 的实数实现
-        x1, x2 = x[..., :mid], x[..., mid:]  # 分割为前半部分和后半部分
+        # 分割为前半部分(实部)和后半部分(虚部)
+        # 论文对应：将head_dim维度分为head_dim/2个复数
+        x1, x2 = x[..., :mid], x[..., mid:]  # x1对应实部，x2对应虚部
         
-        # 重新组合：前半部分取负号并移到后面，后半部分移到前面
-        # 训练作用：保持旋转变换的可微性，支持端到端训练
-        # 推理作用：实现准确的位置编码变换
-        return torch.cat((-x2, x1), dim=-1)
+        # 实现 i*z = i*(a + bi) = -b + ai 的变换
+        # 对应论文中复数旋转的虚部计算
+        # 训练作用：保持旋转不变性，使模型学习到位置无关的表示
+        # 推理作用：准确实现论文中的数学公式，确保位置编码的正确性
+        return torch.cat((-x2, x1), dim=-1)  # [-x2, x1] = [-虚部, 实部] = i*复数
 
-    # 应用旋转变换：x_new = x*cos + rotate_half(x)*sin
-    # 这是复数旋转公式的实数实现：Real(z * e^(iθ)) = Real(z)*cos(θ) - Imag(z)*sin(θ)
+    # === RoPE旋转变换的核心实现 ===
+    # 🧮 论文公式实现：q'_m = q_m * cos(mθ) + rotate_half(q_m) * sin(mθ)
+    # =================================================================
+    # 
+    # 📖 论文对应关系：
+    # ---------------
+    # 论文公式：f_q(x_m, m) = R_Θ,m W_q x_m
+    # 其中 R_Θ,m 是旋转矩阵，在复数域表示为：e^(i*m*θ)
+    # 
+    # 实数域展开：
+    # z * e^(iθ) = (a + bi) * (cos(θ) + i*sin(θ))
+    #            = (a*cos(θ) - b*sin(θ)) + i*(a*sin(θ) + b*cos(θ))
+    # 
+    # 对应到代码：
+    # q_embed = q * cos + rotate_half(q) * sin
+    # 其中 rotate_half(q) 实现了复数乘法中的 i*q 操作
     
-    # 为cos和sin增加维度以匹配q和k的形状进行广播
-    # 训练作用：确保位置编码正确应用到每个注意力头
-    # 推理作用：高效的向量化计算，避免循环操作
-    cos_expanded = cos.unsqueeze(unsqueeze_dim)  # 在指定维度增加一维
+    # 🔧 维度扩展处理：
+    # ---------------
+    # cos和sin的形状：[seq_len, head_dim//2]
+    # q和k的形状：[batch, seq_len, num_heads, head_dim]
+    # 需要在head维度上扩展以支持广播运算
+    # 
+    # 📊 扩展示例：
+    # -----------
+    # 原始：cos [512, 32]，sin [512, 32] (假设head_dim=64)
+    # 扩展：cos [512, 1, 32]，sin [512, 1, 32] (在维度1插入)
+    # 广播：cos [512, 8, 32]，sin [512, 8, 32] (自动扩展到8个头)
+    # 
+    # 训练作用：确保每个注意力头都获得相同的位置编码，保持位置信息的一致性
+    # 推理作用：高效的向量化计算，避免循环操作提升推理速度
+    cos_expanded = cos.unsqueeze(unsqueeze_dim)  # 在head维度插入新维度
     sin_expanded = sin.unsqueeze(unsqueeze_dim)
     
-    # 对查询向量应用旋转位置编码
-    # 训练作用：为查询向量注入位置信息，影响注意力权重的计算
-    # 推理作用：使模型能够识别token的绝对和相对位置
+    # === 应用RoPE到查询向量 ===
+    # 🎯 论文核心：为查询向量注入绝对位置信息，同时保持相对位置感知
+    # =============================================================
+    # 
+    # 📚 理论意义：
+    # -----------
+    # 1. **绝对位置编码**：每个位置m的查询向量都会乘以 e^(i*m*θ)
+    # 2. **相对位置感知**：q_m · k_n = q_m · R_{m-n} · k_n，只依赖位置差
+    # 3. **旋转不变性**：整个序列同时旋转θ角度，相对关系保持不变
+    # 
+    # 🔢 数学验证：
+    # -----------
+    # 原始注意力：score = q_m · k_n
+    # RoPE后：score' = (R_m q_m) · (R_n k_n) = q_m · R_m^T R_n · k_n = q_m · R_{n-m} · k_n
+    # 只依赖于相对位置差 (n-m)，实现了相对位置编码的效果！
+    # 
+    # 🚀 实现细节：
+    # -----------
+    # 第一项：q * cos_expanded
+    # - 对应复数乘法的实部：Real(q) * cos(mθ)
+    # 第二项：rotate_half(q) * sin_expanded  
+    # - 对应复数乘法的虚部：Imag(q) * sin(mθ)
+    # 
+    # 训练作用：为查询向量注入位置信息，使注意力权重具有位置感知能力
+    # 推理作用：确保生成时能正确理解token的绝对和相对位置关系
     q_embed = (q * cos_expanded) + (rotate_half(q) * sin_expanded)
     
-    # 对键向量应用旋转位置编码
-    # 训练作用：为键向量注入位置信息，与查询向量的位置编码配合
-    # 推理作用：确保注意力计算中的位置一致性和相对位置感知
+    # === 应用RoPE到键向量 ===
+    # 🎯 与查询向量配对，形成完整的位置感知注意力机制
+    # ================================================
+    # 
+    # 💡 关键洞察：
+    # -----------
+    # 只有同时对q和k应用RoPE，才能实现论文中的相对位置效果：
+    # - 如果只对q或只对k应用：无法实现相对位置编码
+    # - 同时应用：q_m · k_n → (R_m q_m) · (R_n k_n) = q_m · R_{n-m} · k_n
+    # 
+    # 🔄 对称性原理：
+    # -------------
+    # 查询向量在位置m旋转角度 m*θ
+    # 键向量在位置n旋转角度 n*θ  
+    # 注意力计算时的相对角度：(m-n)*θ，只依赖位置差！
+    # 
+    # 📈 性能优势：
+    # -----------
+    # 1. **无额外参数**：不像传统相对位置编码需要学习位置嵌入
+    # 2. **线性复杂度**：位置编码应用的复杂度是O(d)，而不是O(n²)
+    # 3. **外推能力**：可以处理训练时未见过的更长序列
+    # 
+    # 训练作用：为键向量注入位置信息，与查询向量的位置编码形成配对
+    # 推理作用：确保注意力计算中位置关系的数学正确性和一致性
     k_embed = (k * cos_expanded) + (rotate_half(k) * sin_expanded)
     
     return q_embed, k_embed
@@ -693,8 +835,72 @@ class Attention(nn.Module):
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
         
         # 计算每个注意力头的维度
-        # 训练作用：确定权重矩阵的形状和参数量
-        # 推理作用：影响注意力计算的规模和精度
+        # 🎯 核心原理解释：为什么 head_dim = hidden_size // num_attention_heads？
+        # =====================================================================
+        # 
+        # 📚 理论基础 - 多头注意力的数学原理：
+        # ----------------------------------
+        # 多头注意力机制的核心思想是将大的注意力计算分解为多个小的、并行的注意力计算。
+        # 每个"头"(head)专注于捕捉不同类型的依赖关系和模式。
+        #
+        # 🔢 维度分解的数学逻辑：
+        # ----------------------
+        # 1. 总的特征维度保持不变：
+        #    - 输入维度：hidden_size (例如：512)
+        #    - 输出维度：也必须是 hidden_size (例如：512)
+        #    
+        # 2. 多头并行处理：
+        #    - 假设有 8 个注意力头
+        #    - 每个头处理部分特征：512 ÷ 8 = 64 维
+        #    - 8个头各自处理64维，最后拼接：8 × 64 = 512 维
+        #
+        # 🎯 具体计算示例：
+        # ---------------
+        # 假设 hidden_size=512, num_attention_heads=8：
+        # - head_dim = 512 // 8 = 64
+        # - Q矩阵形状：[512, 8×64] = [512, 512]
+        # - 每个头的Q：[batch, seq_len, 64]
+        # - 8个头拼接后：[batch, seq_len, 8×64] = [batch, seq_len, 512]
+        #
+        # 💡 为什么要这样分解？
+        # -------------------
+        # 1. **并行计算**：8个小注意力可以并行计算，提高效率
+        # 2. **特征多样性**：每个头学习不同的注意力模式
+        #    - Head1可能关注句法关系
+        #    - Head2可能关注语义关系  
+        #    - Head3可能关注长距离依赖...
+        # 3. **计算效率**：8个64维的注意力比1个512维的注意力更高效
+        #    - 注意力复杂度：O(seq_len² × head_dim)
+        #    - 多头：8 × O(seq_len² × 64) vs 单头：O(seq_len² × 512)
+        #    - 并行化后，多头实际更快
+        #
+        # 🔍 数学验证 - 维度一致性：
+        # -------------------------
+        # 输入：x [batch, seq_len, hidden_size]
+        #   ↓ Q投影
+        # Q：[batch, seq_len, num_heads × head_dim] = [batch, seq_len, hidden_size]
+        #   ↓ 重塑为多头
+        # Q：[batch, seq_len, num_heads, head_dim]
+        #   ↓ 转置
+        # Q：[batch, num_heads, seq_len, head_dim]
+        #   ↓ 注意力计算
+        # output：[batch, num_heads, seq_len, head_dim]
+        #   ↓ 转置回来
+        # output：[batch, seq_len, num_heads, head_dim]
+        #   ↓ 重塑合并
+        # output：[batch, seq_len, num_heads × head_dim] = [batch, seq_len, hidden_size]
+        #
+        # ✅ 维度完美保持：输入512维 → 输出512维
+        #
+        # 🚀 工程实现优势：
+        # ---------------
+        # 1. **内存布局优化**：连续的内存访问模式
+        # 2. **GPU并行友好**：可以充分利用GPU的并行计算能力
+        # 3. **数值稳定性**：较小的head_dim有助于数值稳定
+        # 4. **梯度流动**：多个小的attention有助于梯度传播
+        #
+        # 训练作用：确定每个注意力头的表达能力和参数量分配
+        # 推理作用：影响推理时的计算复杂度和内存需求
         self.head_dim = args.hidden_size // args.num_attention_heads
         
         # === QKV投影矩阵定义 ===
@@ -860,10 +1066,70 @@ class Attention(nn.Module):
         xk = xk.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)    # 键：GQA减少的头数
         xv = xv.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)    # 值：与键相同头数
 
-        # === 应用旋转位置编码（RoPE） ===
-        # 提取RoPE的余弦和正弦分量，并应用到查询和键上
-        # 训练作用：让模型学习位置相关的注意力模式，提高位置理解能力
-        # 推理作用：确保模型能够正确理解token的相对位置关系
+        # === RoPE位置编码的解包操作 ===
+        # 🎯 关键理解：position_embeddings 的来源和调用机制详解
+        # ==========================================================
+        # 
+        # 📋 参数传递链分析：
+        # -----------------
+        # 您的疑问很有意思！让我们追踪 position_embeddings 的完整调用链：
+        # 
+        # 1️⃣ **MiniMindModel.forward()** (主模型) 
+        #    ↓ 在这里计算和准备位置编码
+        #    position_embeddings = (
+        #        self.freqs_cos[start_pos:start_pos + seq_length],
+        #        self.freqs_sin[start_pos:start_pos + seq_length]
+        #    )
+        # 
+        # 2️⃣ **MiniMindBlock.forward()** (Transformer层)
+        #    ↓ 接收并传递位置编码
+        #    hidden_states, present = layer(hidden_states, position_embeddings, ...)
+        # 
+        # 3️⃣ **Attention.forward()** (注意力层) ← 我们现在所在的位置
+        #    ↓ 解包并使用位置编码
+        #    cos, sin = position_embeddings  # 这就是当前这行代码！
+        #
+        # 🔍 为什么用元组 (cos, sin) 传递？
+        # ------------------------------
+        # RoPE位置编码需要余弦和正弦两个分量：
+        # - cos: 用于实部的旋转变换
+        # - sin: 用于虚部的旋转变换
+        # - 数学原理：复数旋转 e^(iθ) = cos(θ) + i·sin(θ)
+        # 
+        # 📏 张量形状分析：
+        # ---------------
+        # cos 和 sin 的形状都是：[seq_length, head_dim//2]
+        # - seq_length: 当前序列长度
+        # - head_dim//2: 因为RoPE只应用于每个头维度的一半
+        # 
+        # 💡 与nn.Module继承的关系：
+        # -------------------------
+        # 您问得很好！这里与nn.Module继承关系不大，主要是：
+        # 1. **函数参数传递**：position_embeddings是forward()方法的参数
+        # 2. **上下级调用**：上层MiniMindModel计算好后传递下来
+        # 3. **设计模式**：遵循"谁计算谁传递"的原则
+        #    - MiniMindModel负责计算所有层共享的位置编码
+        #    - 各个Attention层负责使用位置编码
+        # 
+        # 🚀 为什么不在Attention内部计算位置编码？
+        # ------------------------------------------
+        # 1. **性能优化**：避免每个注意力层重复计算相同的位置编码
+        # 2. **内存效率**：在模型层级计算一次，所有层共享使用
+        # 3. **缓存友好**：位置编码可以预计算并缓存
+        # 4. **增量生成支持**：便于处理KV缓存中的位置对齐
+        # 
+        # 🔄 实际执行流程：
+        # ---------------
+        # 训练时：
+        # MiniMindModel.forward() → 计算完整序列的cos,sin
+        # → 传递给每个MiniMindBlock → 传递给Attention → 解包使用
+        # 
+        # 推理时（增量生成）：
+        # MiniMindModel.forward() → 只计算新token的cos,sin  
+        # → 考虑start_pos偏移 → 传递给Attention → 解包使用
+        #
+        # 训练作用：为Q和K张量提供位置感知能力，让模型理解token的相对位置
+        # 推理作用：确保生成时位置编码的连续性和正确性
         cos, sin = position_embeddings
         xq, xk = apply_rotary_pos_emb(xq, xk, cos[:seq_len], sin[:seq_len])
 
@@ -1802,6 +2068,44 @@ class MiniMindModel(nn.Module):
         hidden_states = self.dropout(self.embed_tokens(input_ids))
 
         # 获取当前序列的位置编码
+        # 🎯 这里是 position_embeddings 的计算源头！
+        # ============================================
+        # 
+        # 📍 位置编码的切片逻辑：
+        # --------------------
+        # self.freqs_cos 和 self.freqs_sin 是在模型初始化时预计算的完整位置编码
+        # 形状：[max_position_embeddings, head_dim//2]
+        # 例如：[32768, 32] (假设head_dim=64)
+        # 
+        # start_pos: 当前生成的起始位置
+        # - 训练时：通常为0 (完整序列)
+        # - 推理时：等于已生成的token数量 (增量生成)
+        # 
+        # seq_length: 当前需要处理的序列长度
+        # - 训练时：完整序列长度 (如512)
+        # - 推理时：通常为1 (新生成的token)
+        # 
+        # 🔄 切片示例：
+        # -----------
+        # 训练时：start_pos=0, seq_length=512
+        # → 取 freqs_cos[0:512] 和 freqs_sin[0:512]
+        # 
+        # 推理第1步：start_pos=0, seq_length=1  
+        # → 取 freqs_cos[0:1] 和 freqs_sin[0:1]
+        # 
+        # 推理第10步：start_pos=9, seq_length=1
+        # → 取 freqs_cos[9:10] 和 freqs_sin[9:10]
+        # 
+        # 💡 为什么要动态切片？
+        # -------------------
+        # 1. **内存效率**：只取需要的部分，不浪费内存
+        # 2. **增量生成**：支持逐步生成，位置正确对应
+        # 3. **缓存友好**：与KV缓存的位置保持一致
+        # 
+        # 🚀 接下来的传递路径：
+        # -------------------
+        # 这个 position_embeddings 元组会被传递给每个 MiniMindBlock，
+        # 再传递给每个 Attention 层，最终在那里解包为 cos, sin 使用！
         position_embeddings = (
             self.freqs_cos[start_pos:start_pos + seq_length],
             self.freqs_sin[start_pos:start_pos + seq_length]
